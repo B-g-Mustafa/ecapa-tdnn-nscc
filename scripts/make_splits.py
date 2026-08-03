@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Pool the audio of each language and re-split it 80/10/10 (train/test/val).
+"""Pool the audio of each language and re-split it 80/10/10 (train/test/val)
+IN PLACE inside the dataset root, using symlinks (no file duplication).
 
-Reads the existing split directories under the dataset root (default: the
-`train` and `dev` folders of `common/`), collects every audio file per
-language, then writes a fresh, reproducible 80/10/10 partition.
+This REPLACES the existing split folders. Concretely, given a root like
+`common/` with existing `train/`, `dev/`, `test/` folders full of real audio:
 
-Output (default `<root>/splits_80_10_10/`):
+  1. The existing source folders (--sources, default: train dev test) are
+     moved aside to a backup dir (default: <root>/_pre_split_backup/) so no
+     data is lost or duplicated.
+  2. Every audio file is pooled per language across those backed-up folders.
+  3. Each language is independently re-split 80/10/10.
+  4. New folders <root>/train, <root>/test, <root>/val are created, each
+     containing SYMLINKS (not copies) into the backed-up original files.
+  5. Manifests (path,lang,split,group) are written to
+     <root>/manifests_80_10_10/{train,test,val}.csv and summary.csv.
 
-    manifests/train.csv, test.csv, val.csv   # path,lang,split,group
-    manifests/summary.csv                    # per-language counts
-    audio/train/<lang>/...                   # symlinks, only with --link
-
-Nothing is copied or moved by default: the manifests reference the original
-files in place. Pass --link to additionally build a symlink tree, or
---copy to physically copy the files (slow, doubles disk usage).
+Nothing on disk is touched unless you drop --dry-run. Re-running after a
+successful run is refused (the tool detects it via _pre_split_backup) —
+pass --force only if you understand what a second pass would do.
 
 Usage:
+    python scripts/make_splits.py /path/to/common --dry-run
     python scripts/make_splits.py /path/to/common
     python scripts/make_splits.py /path/to/common --sources train dev --seed 1337
-    python scripts/make_splits.py /path/to/common --group-by parent --link
-    python scripts/make_splits.py /path/to/common --min-per-split 2 --dry-run
+    python scripts/make_splits.py /path/to/common --group-by parent
 """
 
 import argparse
@@ -27,6 +31,7 @@ import csv
 import os
 import random
 import re
+import shutil
 import sys
 
 DEFAULT_EXTS = (".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".sph", ".aac")
@@ -39,13 +44,12 @@ def is_audio(name, exts):
     return name.lower().endswith(exts)
 
 
-def collect(root, sources, exts):
-    """Return {lang: [abs_path, ...]} pooled over the source split dirs."""
+def collect(source_dirs, exts):
+    """source_dirs: {source_name: path}. Returns {lang: [abs_path, ...]}."""
     per_lang = {}
-    for src in sources:
-        src_dir = os.path.join(root, src)
+    for name, src_dir in source_dirs.items():
         if not os.path.isdir(src_dir):
-            print(f"[warn] source split not found, skipping: {src_dir}", file=sys.stderr)
+            print(f"[warn] source directory not found, skipping: {src_dir}", file=sys.stderr)
             continue
         langs = sorted(
             d for d in os.listdir(src_dir)
@@ -53,7 +57,8 @@ def collect(root, sources, exts):
         )
         for lang in langs:
             bucket = per_lang.setdefault(lang, [])
-            for dirpath, dirnames, filenames in os.walk(os.path.join(src_dir, lang)):
+            lang_dir = os.path.join(src_dir, lang)
+            for dirpath, dirnames, filenames in os.walk(lang_dir):
                 dirnames[:] = [d for d in dirnames if not d.startswith("._")]
                 for f in sorted(filenames):
                     if is_audio(f, exts):
@@ -78,10 +83,7 @@ def group_key(path, lang_root, mode, pattern):
 
 
 def split_groups(groups, ratios, seed, lang, min_per_split):
-    """Assign whole groups to train/test/val, sizing by file count.
-
-    groups: {key: [paths]}. Returns {split: [paths]}.
-    """
+    """Assign whole groups to train/test/val, sizing by file count."""
     rng = random.Random(f"{seed}:{lang}")
     keys = sorted(groups)
     rng.shuffle(keys)
@@ -95,12 +97,9 @@ def split_groups(groups, ratios, seed, lang, min_per_split):
     out = {s: [] for s in SPLIT_NAMES}
     counts = {s: 0 for s in SPLIT_NAMES}
 
-    # Seed the small splits first so they are never starved on tiny languages.
-    order = ["val", "test", "train"]
     for key in keys:
         n = len(groups[key])
-        # pick the split furthest below its target, in files
-        pick = max(order, key=lambda s: (targets[s] - counts[s]) / max(targets[s], 1e-9))
+        pick = max(SPLIT_NAMES, key=lambda s: (targets[s] - counts[s]) / max(targets[s], 1e-9))
         out[pick].extend(groups[key])
         counts[pick] += n
 
@@ -109,47 +108,6 @@ def split_groups(groups, ratios, seed, lang, min_per_split):
             print(f"[warn] {lang}: only {counts[s]} file(s) in '{s}' "
                   f"(min-per-split={min_per_split}, total={total})", file=sys.stderr)
     return out
-
-
-def materialize(rows, out_audio, root, mode):
-    """Create a symlink ('link') or copy ('copy') tree mirroring the splits."""
-    import shutil
-    made = 0
-    for path, lang, split, _ in rows:
-        rel = os.path.relpath(path, root).replace(os.sep, "__")
-        dest_dir = os.path.join(out_audio, split, lang)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, rel)
-        if os.path.lexists(dest):
-            continue
-        if mode == "link":
-            os.symlink(os.path.abspath(path), dest)
-        else:
-            shutil.copy2(path, dest)
-        made += 1
-    print(f"{'Linked' if mode == 'link' else 'Copied'} {made:,} files into {out_audio}")
-
-
-def write_manifests(rows_by_split, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    for split, rows in rows_by_split.items():
-        path = os.path.join(out_dir, f"{split}.csv")
-        with open(path, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["path", "lang", "split", "group"])
-            w.writerows(rows)
-        print(f"Wrote {path}  ({len(rows):,} rows)")
-
-
-def write_summary(per_lang_counts, out_dir):
-    path = os.path.join(out_dir, "summary.csv")
-    with open(path, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["lang", "train", "test", "val", "total"])
-        for lang in sorted(per_lang_counts):
-            c = per_lang_counts[lang]
-            w.writerow([lang, c["train"], c["test"], c["val"], sum(c.values())])
-    print(f"Wrote {path}")
 
 
 def print_table(per_lang_counts):
@@ -179,14 +137,40 @@ def print_table(per_lang_counts):
           + f"{grand:,}".rjust(12))
 
 
+def write_manifests(rows_by_split, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    for split, rows in rows_by_split.items():
+        path = os.path.join(out_dir, f"{split}.csv")
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["path", "lang", "split", "group"])
+            w.writerows(rows)
+        print(f"Wrote {path}  ({len(rows):,} rows)")
+
+
+def write_summary(per_lang_counts, out_dir):
+    path = os.path.join(out_dir, "summary.csv")
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["lang", "train", "test", "val", "total"])
+        for lang in sorted(per_lang_counts):
+            c = per_lang_counts[lang]
+            w.writerow([lang, c["train"], c["test"], c["val"], sum(c.values())])
+    print(f"Wrote {path}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("root", help="dataset root (e.g. .../common)")
-    p.add_argument("--sources", nargs="+", default=["train", "dev"],
-                   help="existing split dirs to pool from (default: train dev)")
-    p.add_argument("--out", default="splits_80_10_10",
-                   help="output dir, relative to root unless absolute")
+    p.add_argument("--sources", nargs="+", default=["train", "dev", "test"],
+                   help="existing folders under root to pool audio from and "
+                        "replace (default: train dev test)")
+    p.add_argument("--backup-dir", default=None,
+                   help="where the original source folders are moved before "
+                        "the new split is written (default: <root>/_pre_split_backup)")
+    p.add_argument("--manifest-dir", default=None,
+                   help="where manifests are written (default: <root>/manifests_80_10_10)")
     p.add_argument("--ratios", nargs=3, type=float, default=[0.8, 0.1, 0.1],
                    metavar=("TRAIN", "TEST", "VAL"), help="split ratios")
     p.add_argument("--seed", type=int, default=1337, help="RNG seed (per-language)")
@@ -200,24 +184,43 @@ def main():
                    help="audio extensions to include")
     p.add_argument("--min-per-split", type=int, default=1,
                    help="warn if a language ends up with fewer files in a split")
-    p.add_argument("--link", action="store_true", help="also build a symlink tree")
-    p.add_argument("--copy", action="store_true", help="also copy the audio files")
+    p.add_argument("--copy", action="store_true",
+                   help="copy files instead of symlinking (uses more disk)")
+    p.add_argument("--force", action="store_true",
+                   help="proceed even if backup dir or target split dirs already exist")
     p.add_argument("--dry-run", action="store_true",
-                   help="print the table only, write nothing")
+                   help="print the table only, touch nothing on disk")
     args = p.parse_args()
 
     if not os.path.isdir(args.root):
         sys.exit(f"error: not a directory: {args.root}")
     if abs(sum(args.ratios) - 1.0) > 1e-6:
         sys.exit(f"error: ratios must sum to 1.0, got {sum(args.ratios)}")
-    if args.link and args.copy:
-        sys.exit("error: use either --link or --copy, not both")
 
+    root = os.path.abspath(args.root)
+    backup_dir = os.path.abspath(args.backup_dir) if args.backup_dir else os.path.join(root, "_pre_split_backup")
+    manifest_dir = os.path.abspath(args.manifest_dir) if args.manifest_dir else os.path.join(root, "manifests_80_10_10")
     exts = tuple(e.lower() if e.startswith(".") else "." + e.lower() for e in args.ext)
     pattern = re.compile(args.group_regex)
-    out_dir = args.out if os.path.isabs(args.out) else os.path.join(args.root, args.out)
 
-    per_lang = collect(args.root, args.sources, exts)
+    source_dirs = {name: os.path.join(root, name) for name in args.sources}
+
+    # Safety checks before doing anything destructive.
+    if not args.dry_run:
+        if os.path.exists(backup_dir) and not args.force:
+            sys.exit(f"error: backup dir already exists ({backup_dir}) — looks like this "
+                      f"was already run. Pass --force to proceed anyway.")
+        for split in SPLIT_NAMES:
+            target = os.path.join(root, split)
+            if os.path.islink(target) and not args.force:
+                sys.exit(f"error: {target} is already a symlink dir (previous run's output). "
+                          f"Pass --force to overwrite.")
+        for split in SPLIT_NAMES:
+            if split in source_dirs and os.path.islink(source_dirs[split]):
+                sys.exit(f"error: source {source_dirs[split]} is a symlink, not the original "
+                          f"data — refusing to pool from it.")
+
+    per_lang = collect(source_dirs, exts)
     per_lang = {k: v for k, v in per_lang.items() if v}
     if not per_lang:
         sys.exit("error: no audio files found under the given sources")
@@ -225,7 +228,7 @@ def main():
     rows_by_split = {s: [] for s in SPLIT_NAMES}
     counts = {}
     for lang, paths in sorted(per_lang.items()):
-        lang_roots = [os.path.join(args.root, s, lang) for s in args.sources]
+        lang_roots = [os.path.join(d, lang) for d in source_dirs.values()]
         groups = {}
         for path in paths:
             lang_root = next((r for r in lang_roots if path.startswith(r + os.sep)),
@@ -233,8 +236,7 @@ def main():
             key = group_key(path, lang_root, args.group_by, pattern)
             groups.setdefault(key, []).append(path)
 
-        assigned = split_groups(groups, args.ratios, args.seed, lang,
-                                args.min_per_split)
+        assigned = split_groups(groups, args.ratios, args.seed, lang, args.min_per_split)
         counts[lang] = {s: len(assigned[s]) for s in SPLIT_NAMES}
 
         inv = {p: k for k, ps in groups.items() for p in ps}
@@ -245,19 +247,75 @@ def main():
     print_table(counts)
     print(f"\ngrouping: {args.group_by}   seed: {args.seed}   "
           f"ratios: {args.ratios[0]:.2f}/{args.ratios[1]:.2f}/{args.ratios[2]:.2f}")
+    print(f"sources: {', '.join(source_dirs.values())}")
+    print(f"backup:  {backup_dir}")
+    print(f"targets: {', '.join(os.path.join(root, s) for s in SPLIT_NAMES)}")
 
     if args.dry_run:
-        print("\n--dry-run: nothing written")
+        print("\n--dry-run: nothing written, nothing moved")
         return
 
-    manifest_dir = os.path.join(out_dir, "manifests")
+    # 1. Move original source folders aside so nothing is lost or duplicated.
+    os.makedirs(backup_dir, exist_ok=True)
+    moved_from = {}
+    for name, src in source_dirs.items():
+        if not os.path.isdir(src):
+            continue
+        dest = os.path.join(backup_dir, name)
+        if os.path.exists(dest):
+            sys.exit(f"error: backup target already exists: {dest}")
+        shutil.move(src, dest)
+        moved_from[name] = dest
+        print(f"Moved {src} -> {dest}")
+
+    # 2. Rewrite collected paths to point at the backed-up originals.
+    def relocate(path):
+        for name, src in source_dirs.items():
+            if name in moved_from and path.startswith(src + os.sep):
+                return moved_from[name] + path[len(src):]
+        return path
+
+    for split in SPLIT_NAMES:
+        for row in rows_by_split[split]:
+            row[0] = relocate(row[0])
+
+    # 3. Build the new train/test/val symlink (or copy) trees.
+    for split in SPLIT_NAMES:
+        split_dir = os.path.join(root, split)
+        if os.path.exists(split_dir) or os.path.islink(split_dir):
+            if os.path.islink(split_dir) or not os.listdir(split_dir):
+                if os.path.islink(split_dir):
+                    os.unlink(split_dir)
+                else:
+                    os.rmdir(split_dir)
+            elif not args.force:
+                sys.exit(f"error: {split_dir} already exists and is non-empty")
+        os.makedirs(split_dir, exist_ok=True)
+
+    made = 0
+    for split in SPLIT_NAMES:
+        for path, lang, _, _ in rows_by_split[split]:
+            lang_dir = os.path.join(root, split, lang)
+            os.makedirs(lang_dir, exist_ok=True)
+            dest = os.path.join(lang_dir, os.path.basename(path))
+            if os.path.lexists(dest):
+                # avoid collisions between files that share a basename
+                stem, ext = os.path.splitext(os.path.basename(path))
+                i = 2
+                while os.path.lexists(dest):
+                    dest = os.path.join(lang_dir, f"{stem}__{i}{ext}")
+                    i += 1
+            if args.copy:
+                shutil.copy2(path, dest)
+            else:
+                os.symlink(path, dest)
+            made += 1
+    print(f"\n{'Copied' if args.copy else 'Symlinked'} {made:,} files into "
+          f"{', '.join(os.path.join(root, s) for s in SPLIT_NAMES)}")
+
+    # 4. Manifests.
     write_manifests(rows_by_split, manifest_dir)
     write_summary(counts, manifest_dir)
-
-    if args.link or args.copy:
-        all_rows = [r for s in SPLIT_NAMES for r in rows_by_split[s]]
-        materialize(all_rows, os.path.join(out_dir, "audio"), args.root,
-                    "link" if args.link else "copy")
 
 
 if __name__ == "__main__":
