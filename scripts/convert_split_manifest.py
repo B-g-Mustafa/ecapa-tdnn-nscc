@@ -62,12 +62,14 @@ def main():
     p.add_argument("--check-exists", action="store_true", default=True,
                    help="verify every referenced audio file actually exists before writing "
                         "(catches a stale _pre_split_backup/ early, rather than failing "
-                        "file-by-file during training)")
+                        "file-by-file during training). Cheap — just a stat() per file, "
+                        "not an audio read — kept on by default.")
     p.add_argument("--no-check-exists", dest="check_exists", action="store_false")
-    p.add_argument("--skip-duration", action="store_true",
-                   help="write duration=0.0 instead of reading every file's header. "
-                        "Faster, but train_19class.py doesn't use duration for anything "
-                        "besides the manifest format, so this is safe to use.")
+    p.add_argument("--compute-duration", action="store_true", default=False,
+                   help="read every file's header via soundfile.info() to write a real "
+                        "duration. SLOW at this scale (~410k files) and train_19class.py "
+                        "doesn't use the duration field for anything — off by default. "
+                        "duration is written as 0.0 unless this is passed.")
     args = p.parse_args()
 
     lang_map = load_lang_map(args.lang_map)
@@ -105,9 +107,7 @@ def main():
                 missing_files.append(path)
                 continue
 
-            if args.skip_duration:
-                duration = 0.0
-            else:
+            if args.compute_duration:
                 try:
                     info = sf.info(path)
                     duration = info.frames / float(info.samplerate)
@@ -115,6 +115,8 @@ def main():
                     print(f"[warn] could not read {path}: {e}", file=sys.stderr)
                     skipped_unreadable += 1
                     continue
+            else:
+                duration = 0.0
 
             per_lang_count[lang] = per_lang_count.get(lang, 0) + 1
             out_rows.append({
