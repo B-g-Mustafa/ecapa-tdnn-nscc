@@ -119,31 +119,55 @@ def build_sampler(rows, code_to_idx):
 # --------------------------------------------------------------------------
 
 def build_speed_perturb(device):
+    """Returns a function with a uniform (wavs, rel_lengths) -> (wavs, rel_lengths)
+    signature, regardless of which backend is used underneath.
+
+    SpeedPerturb resamples the whole (batch, time) tensor by one randomly
+    chosen speed factor, applied uniformly across the batch. Because both a
+    sample's real content and the batch's total padded length scale by that
+    same factor, each sample's *relative* length (content / padded_length) is
+    unchanged by the transform — so rel_lengths is passed through as-is
+    rather than recomputed.
+    """
     try:
         from speechbrain.augment.time_domain import SpeedPerturb
-        return SpeedPerturb(orig_freq=SAMPLE_RATE, speeds=[95, 100, 105]).to(device)
+        sb_fn = SpeedPerturb(orig_freq=SAMPLE_RATE, speeds=[95, 100, 105]).to(device)
+
+        def wrapped(wavs, rel_lengths):
+            # SpeedPerturb.forward(self, waveforms) takes ONLY the waveform
+            # tensor — passing rel_lengths as a second positional arg raises
+            # TypeError: forward() takes 2 positional arguments but 3 were given.
+            return sb_fn(wavs), rel_lengths
+
+        return wrapped
     except ImportError:
         pass
+
     try:
         from speechbrain.lobes.augment import TimeDomainSpecAugment  # older versions bundle speed here
-        return TimeDomainSpecAugment(sample_rate=SAMPLE_RATE, speeds=[95, 100, 105]).to(device)
+        sb_fn = TimeDomainSpecAugment(sample_rate=SAMPLE_RATE, speeds=[95, 100, 105]).to(device)
+
+        def wrapped(wavs, rel_lengths):
+            return sb_fn(wavs), rel_lengths
+
+        return wrapped
     except ImportError:
         pass
 
     print("[warn] SpeechBrain SpeedPerturb not found under either known import path; "
           "using a minimal manual resample-based fallback.", file=sys.stderr)
 
-    def manual_speed_perturb(wavs, lengths):
+    def manual_speed_perturb(wavs, rel_lengths):
         import torchaudio
         speed = random.choice([0.95, 1.0, 1.05])
         if speed == 1.0:
-            return wavs, lengths
+            return wavs, rel_lengths
         new_sr = int(SAMPLE_RATE * speed)
         out = torchaudio.functional.resample(wavs, SAMPLE_RATE, new_sr)
         out = torchaudio.functional.resample(out, new_sr, SAMPLE_RATE)
         # length changes negligibly after resample-round-trip; keep original rel lengths
         min_len = min(out.shape[1], wavs.shape[1])
-        return out[:, :min_len], lengths
+        return out[:, :min_len], rel_lengths
 
     return manual_speed_perturb
 
@@ -177,14 +201,6 @@ def build_specaugment(device):
         return feats
 
     return manual_specaugment
-
-
-def apply_speed_perturb(fn, wavs, rel_lengths):
-    try:
-        return fn(wavs, rel_lengths), rel_lengths
-    except TypeError:
-        out, lengths = fn(wavs, rel_lengths)
-        return out, lengths
 
 
 # --------------------------------------------------------------------------
@@ -311,7 +327,9 @@ def main():
                    help="embedding_model.* module-path prefixes to unfreeze (Phase 3). "
                         "Never pass blocks.0/1/2.")
     p.add_argument("--savedir", default=None)
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default=None,
+                   help="'cpu', 'cuda', 'cuda:0', etc. Default: auto-detect — "
+                        "cuda:0 if available, else cpu.")
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=48)
     p.add_argument("--lr-head", type=float, default=1e-3)
@@ -328,6 +346,10 @@ def main():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=1337)
     args = p.parse_args()
+
+    if args.device is None:
+        args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {args.device}")
 
     forbidden = ("embedding_model.blocks.0", "embedding_model.blocks.1", "embedding_model.blocks.2")
     for pattern in args.unfreeze:
@@ -428,7 +450,7 @@ def main():
             wavs, rel_lengths, labels = wavs.to(device), rel_lengths.to(device), labels.to(device)
 
             if speed_perturb is not None:
-                wavs, rel_lengths = apply_speed_perturb(speed_perturb, wavs, rel_lengths)
+                wavs, rel_lengths = speed_perturb(wavs, rel_lengths)
 
             log_probs = forward_batch(model, wavs, rel_lengths, has_unfrozen_encoder,
                                        specaugment_fn=specaugment, training=True)
