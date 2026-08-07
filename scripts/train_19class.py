@@ -59,6 +59,41 @@ WATCH_CLASSES = ("zh", "yue", "vi", "th")  # per the measured zero-shot confusio
 
 
 # --------------------------------------------------------------------------
+# Logging — writes to disk immediately, every call, instead of relying on
+# stdout redirection. PBS (and similar batch schedulers) buffer a job's
+# stdout and only flush it to the -o log file when the job exits or the
+# buffer fills, so `print()` alone can look like "nothing happened until
+# walltime ran out" even though training was progressing fine. Every call
+# here opens the log file, writes, and closes it — no handle is held open
+# across epochs — so `tail -f` on the log file reflects real progress.
+# --------------------------------------------------------------------------
+
+def init_log(path):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(f"# train_19class.py log — started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+
+def append_log(path, text):
+    if not path:
+        return
+    with open(path, "a") as fh:
+        fh.write(text)
+        if not text.endswith("\n"):
+            fh.write("\n")
+
+
+def log(msg, log_path=None):
+    """print immediately (flush=True, so it isn't stuck in Python's stdout
+    buffer either) and, if a log file is configured, durably append the
+    same text to it via an open-write-close cycle."""
+    print(msg, flush=True)
+    append_log(log_path, msg)
+
+
+# --------------------------------------------------------------------------
 # Data
 # --------------------------------------------------------------------------
 
@@ -280,23 +315,24 @@ def evaluate(model, loader, idx_to_code, device, has_unfrozen_encoder):
     }
 
 
-def print_epoch_report(epoch, train_loss, eval_result, idx_to_code):
-    print(f"\n--- Epoch {epoch} ---")
-    print(f"train_loss={train_loss:.4f}  val_loss={eval_result['val_loss']:.4f}  "
-          f"val_acc={eval_result['overall_acc']:.4f}")
+def print_epoch_report(epoch, train_loss, eval_result, idx_to_code, log_path=None):
+    lines = [f"\n--- Epoch {epoch} ---"]
+    lines.append(f"train_loss={train_loss:.4f}  val_loss={eval_result['val_loss']:.4f}  "
+                 f"val_acc={eval_result['overall_acc']:.4f}")
     watch = [c for c in WATCH_CLASSES if c in idx_to_code]
     if watch:
         parts = []
         for c in watch:
             r = eval_result["per_class_recall"][c]
             parts.append(f"{c}={r:.4f}" if r is not None else f"{c}=n/a")
-        print("  watch: " + "  ".join(parts))
+        lines.append("  watch: " + "  ".join(parts))
     for c in idx_to_code:
         r = eval_result["per_class_recall"][c]
         tag = " *" if c in WATCH_CLASSES else ""
         r_str = f"{r:.4f}" if r is not None else "n/a"
-        print(f"  {c:6s} {eval_result['correct'][c]:>6}/{eval_result['total'][c]:<6} "
-              f"{r_str}{tag}")
+        lines.append(f"  {c:6s} {eval_result['correct'][c]:>6}/{eval_result['total'][c]:<6} "
+                     f"{r_str}{tag}")
+    log("\n".join(lines), log_path)
 
 
 def lr_lambda_factory(total_steps, warmup_fraction):
@@ -345,11 +381,23 @@ def main():
     p.add_argument("--no-specaugment", dest="specaugment", action="store_false")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--log-file", default=None,
+                   help="path to a progress log, appended to after every epoch "
+                        "(default: <output-dir>/train_log.txt). Written via an "
+                        "open-write-close cycle each time, not a held-open handle, "
+                        "so `tail -f` on it shows real progress even when a PBS "
+                        "job's stdout capture only flushes at walltime end.")
     args = p.parse_args()
 
     if args.device is None:
         args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {args.device}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.log_file is None:
+        args.log_file = os.path.join(args.output_dir, "train_log.txt")
+    init_log(args.log_file)
+    log(f"Using device: {args.device}", args.log_file)
+    log(f"Log file: {args.log_file}", args.log_file)
 
     forbidden = ("embedding_model.blocks.0", "embedding_model.blocks.1", "embedding_model.blocks.2")
     for pattern in args.unfreeze:
@@ -359,7 +407,6 @@ def main():
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
 
     train_rows = read_manifest_csv(os.path.join(args.manifest_dir, "train.csv"))
     val_path = os.path.join(args.manifest_dir, f"{args.val_split}.csv")
@@ -367,7 +414,7 @@ def main():
         alt = "dev" if args.val_split == "val" else "val"
         alt_path = os.path.join(args.manifest_dir, f"{alt}.csv")
         if os.path.exists(alt_path):
-            print(f"[info] {val_path} not found, using {alt_path} instead")
+            log(f"[info] {val_path} not found, using {alt_path} instead", args.log_file)
             val_path = alt_path
         else:
             sys.exit(f"error: neither {val_path} nor {alt_path} found")
@@ -376,20 +423,20 @@ def main():
     lang_map = load_lang_map(args.lang_map)
     lang_codes = [code for _, code in lang_map]
 
-    print(f"Loading model from {args.source} ...")
+    log(f"Loading model from {args.source} ...", args.log_file)
     savedir = args.savedir or "./pretrained_model_cache"
     model = load_classifier(args.source, savedir, args.device)
     device = torch.device(args.device)
 
-    print("Expanding classifier head 107 -> 18 ...")
+    log("Expanding classifier head 107 -> 18 ...", args.log_file)
     code_to_oldidx, idx_to_code = expand_classifier_head(
         model, lang_codes, args.yue_code, device, seed=args.seed
     )
     code_to_idx = {c: i for i, c in enumerate(idx_to_code)}
-    print(f"idx_to_code = {idx_to_code}")
+    log(f"idx_to_code = {idx_to_code}", args.log_file)
 
     if args.init_checkpoint:
-        print(f"Loading weights from {args.init_checkpoint} ...")
+        log(f"Loading weights from {args.init_checkpoint} ...", args.log_file)
         ckpt = torch.load(args.init_checkpoint, map_location=device)
         model.mods.embedding_model.load_state_dict(ckpt["embedding_model_state"])
         model.mods.classifier.load_state_dict(ckpt["classifier_state"])
@@ -400,7 +447,8 @@ def main():
 
     n_unfrozen = set_unfreeze_patterns(model.mods.embedding_model, args.unfreeze)
     has_unfrozen_encoder = n_unfrozen > 0
-    print(f"Encoder: {'FROZEN (Phase 1)' if not has_unfrozen_encoder else f'{n_unfrozen} params unfrozen (Phase 3): {args.unfreeze}'}")
+    log(f"Encoder: {'FROZEN (Phase 1)' if not has_unfrozen_encoder else f'{n_unfrozen} params unfrozen (Phase 3): {args.unfreeze}'}",
+        args.log_file)
     for p_ in model.mods.classifier.parameters():
         p_.requires_grad_(True)
 
@@ -434,8 +482,8 @@ def main():
     # over those indices should already look sane (near the pretrained model's
     # own behaviour) since their rows were copied verbatim.
     initial_eval = evaluate(model, val_loader, idx_to_code, device, has_unfrozen_encoder)
-    print("\n=== Pre-training baseline (this run's val split) ===")
-    print_epoch_report(0, float("nan"), initial_eval, idx_to_code)
+    log("\n=== Pre-training baseline (this run's val split) ===", args.log_file)
+    print_epoch_report(0, float("nan"), initial_eval, idx_to_code, log_path=args.log_file)
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
@@ -466,8 +514,8 @@ def main():
 
         train_loss = running_loss / max(n_batches, 1)
         eval_result = evaluate(model, val_loader, idx_to_code, device, has_unfrozen_encoder)
-        print_epoch_report(epoch, train_loss, eval_result, idx_to_code)
-        print(f"  epoch time: {time.time() - epoch_start:.1f}s")
+        print_epoch_report(epoch, train_loss, eval_result, idx_to_code, log_path=args.log_file)
+        log(f"  epoch time: {time.time() - epoch_start:.1f}s", args.log_file)
 
         if eval_result["val_loss"] < best_val_loss:
             best_val_loss = eval_result["val_loss"]
@@ -484,16 +532,16 @@ def main():
                 "val_loss": best_val_loss,
                 "val_metrics": eval_result,
             }, best_path)
-            print(f"  -> saved new best checkpoint to {best_path}")
+            log(f"  -> saved new best checkpoint to {best_path}", args.log_file)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.early_stop_patience:
-                print(f"\nEarly stopping: no val_loss improvement for "
-                      f"{args.early_stop_patience} epochs.")
+                log(f"\nEarly stopping: no val_loss improvement for "
+                    f"{args.early_stop_patience} epochs.", args.log_file)
                 break
 
-    print(f"\nDone. Best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
-    print("Next: scripts/evaluate_19class.py --checkpoint " + best_path)
+    log(f"\nDone. Best checkpoint: {best_path} (val_loss={best_val_loss:.4f})", args.log_file)
+    log("Next: scripts/evaluate_19class.py --checkpoint " + best_path, args.log_file)
 
 
 if __name__ == "__main__":
