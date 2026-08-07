@@ -64,13 +64,23 @@ def split_label(text_lab):
 
 
 def load_classifier(source, savedir, device):
-    """Load the pretrained EncoderClassifier the same way evaluate_lid.py does."""
+    """Load the pretrained EncoderClassifier the same way evaluate_lid.py does.
+
+    `device` may be a plain string ("cuda:0") or a torch.device object —
+    SpeechBrain's Pretrained.__init__ does string-only operations on it
+    internally (e.g. `"cuda" in self.device`, `self.device.split(":")`), so
+    it is coerced to str() here regardless of what the caller passed in.
+    Without this, passing a torch.device raises
+    `TypeError: argument of type 'torch.device' is not iterable` deep inside
+    speechbrain/inference/interfaces.py.
+    """
     try:
         from speechbrain.inference.classifiers import EncoderClassifier
     except ImportError:
         from speechbrain.pretrained import EncoderClassifier  # older speechbrain versions
 
-    run_opts = {"device": device} if device else None
+    device_str = str(device) if device else None
+    run_opts = {"device": device_str} if device_str else None
     return EncoderClassifier.from_hparams(
         source=source, savedir=savedir, run_opts=run_opts
     )
