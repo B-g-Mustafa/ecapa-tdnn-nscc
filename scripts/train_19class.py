@@ -5,8 +5,11 @@ Model surgery: classifier.out.w is replaced 107-way -> 18-way (17 lang_map.csv
 languages, in file order, + yue). Rows for the 17 languages are copied
 verbatim from the pretrained weights; the yue row is freshly initialised.
 The encoder is frozen by default (Phase 1). Pass --unfreeze with one or more
-module-path prefixes (e.g. --unfreeze embedding_model.blocks.3) to unfreeze
-specific encoder parts for Phase 3 — never pass blocks.0/1/2, per the plan.
+module-path prefixes (e.g. --unfreeze blocks.3 mfa) to unfreeze specific
+encoder parts for Phase 3 — never pass blocks.0/1/2, per the plan. Paths are
+relative to embedding_model; an "embedding_model." prefix is stripped if you
+include it. A pattern that matches nothing is a hard error, not a silent
+fallback to head-only training.
 
 BatchNorm running stats inside embedding_model are ALWAYS kept in eval mode,
 regardless of --unfreeze — only a block's conv/affine weights become
@@ -29,7 +32,7 @@ Usage:
     python scripts/train_19class.py \\
         --manifest-dir ... --lang-map ... --output-dir ./runs/phase3a \\
         --init-checkpoint ./runs/phase1_head_only/best.pt \\
-        --unfreeze embedding_model.blocks.3 \\
+        --unfreeze blocks.3 blocks.1.se_block blocks.2.se_block \\
         --lr-encoder 1e-4 --epochs 8 --device cuda:0
 """
 
@@ -360,8 +363,10 @@ def main():
                    help="resume model weights from a previous train_19class.py checkpoint "
                         "(e.g. Phase 1's best.pt, before Phase 3 unfreezing)")
     p.add_argument("--unfreeze", nargs="+", default=[],
-                   help="embedding_model.* module-path prefixes to unfreeze (Phase 3). "
-                        "Never pass blocks.0/1/2.")
+                   help="module-path prefixes inside embedding_model to unfreeze, e.g. "
+                        "'blocks.3 mfa blocks.1.se_block'. An 'embedding_model.' prefix "
+                        "is stripped if present. Never pass blocks.0/1/2. Patterns that "
+                        "match no parameters are a hard error.")
     p.add_argument("--savedir", default=None)
     p.add_argument("--device", default=None,
                    help="'cpu', 'cuda', 'cuda:0', etc. Default: auto-detect — "
@@ -399,9 +404,20 @@ def main():
     log(f"Using device: {args.device}", args.log_file)
     log(f"Log file: {args.log_file}", args.log_file)
 
-    forbidden = ("embedding_model.blocks.0", "embedding_model.blocks.1", "embedding_model.blocks.2")
+    # --unfreeze patterns are matched against model.mods.embedding_model's OWN
+    # named_parameters(), which yield names like "blocks.3.tdnn1.conv.conv.weight"
+    # — with no "embedding_model." prefix. Accept either spelling by stripping
+    # that prefix, so the documented form and the internal form both work.
+    # (Without this, "--unfreeze embedding_model.blocks.3" silently matches
+    # nothing and the run quietly degrades to head-only training.)
+    args.unfreeze = [
+        p[len("embedding_model."):] if p.startswith("embedding_model.") else p
+        for p in args.unfreeze
+    ]
+
+    forbidden = ("blocks.0", "blocks.1", "blocks.2")
     for pattern in args.unfreeze:
-        if any(pattern == f or pattern.startswith(f) for f in forbidden):
+        if any(pattern == f or pattern.startswith(f + ".") for f in forbidden):
             sys.exit(f"error: --unfreeze {pattern} touches a forbidden low-level block "
                      f"(blocks.0/1/2). Per the plan, these must never be unfrozen.")
 
@@ -447,8 +463,21 @@ def main():
 
     n_unfrozen = set_unfreeze_patterns(model.mods.embedding_model, args.unfreeze)
     has_unfrozen_encoder = n_unfrozen > 0
-    log(f"Encoder: {'FROZEN (Phase 1)' if not has_unfrozen_encoder else f'{n_unfrozen} params unfrozen (Phase 3): {args.unfreeze}'}",
-        args.log_file)
+
+    # A non-empty --unfreeze that matches nothing means a mistyped module path.
+    # Fail loudly: silently falling back to head-only would look like a valid
+    # Phase 3 run and waste the whole job.
+    if args.unfreeze and not has_unfrozen_encoder:
+        top = sorted({n.split(".")[0] for n, _ in model.mods.embedding_model.named_parameters()})
+        sys.exit(f"error: --unfreeze {args.unfreeze} matched 0 parameters. "
+                 f"Top-level modules available: {top}. "
+                 f"Example: --unfreeze blocks.3 mfa")
+
+    if has_unfrozen_encoder:
+        n_params = sum(p_.numel() for p_ in model.mods.embedding_model.parameters() if p_.requires_grad)
+        log(f"Encoder: {n_unfrozen} tensors / {n_params:,} params unfrozen: {args.unfreeze}", args.log_file)
+    else:
+        log("Encoder: FROZEN (Phase 1)", args.log_file)
     for p_ in model.mods.classifier.parameters():
         p_.requires_grad_(True)
 
