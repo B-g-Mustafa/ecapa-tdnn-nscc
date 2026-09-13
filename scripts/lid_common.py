@@ -7,7 +7,10 @@ behavior are identical across every script that touches the model.
 """
 
 import csv
+import json
 import os
+import sys
+from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -232,3 +235,122 @@ def write_manifest_csv(path, rows):
         writer = csv.DictWriter(fh, fieldnames=["ID", "duration", "wav", "label"])
         writer.writeheader()
         writer.writerows(rows)
+
+
+# Field-name aliases tried in order, for manifests whose exact schema isn't
+# known ahead of time (e.g. a colleague's NeMo-style JSON manifest). First
+# match wins per entry.
+_JSON_PATH_KEYS = ("audio_filepath", "wav", "path", "audio", "filepath")
+_JSON_LABEL_KEYS = ("label", "lang", "language", "lang_id", "target")
+_JSON_DURATION_KEYS = ("duration", "dur")
+
+
+def read_manifest_json(path):
+    """Read a JSON manifest into the same row shape read_manifest_csv returns
+    (dicts with ID, duration, wav, label) — so callers never need to care
+    which format a manifest came from.
+
+    Handles both common conventions, auto-detected:
+      - one JSON object per line (NeMo/Lhotse-style JSONL — the common case
+        for manifests produced by NeMo tooling)
+      - a single JSON array of objects
+
+    Field names are also auto-detected across common aliases (see
+    _JSON_*_KEYS above), since the exact schema of a manifest handed over by
+    someone else's pipeline isn't something to guess once and hope — a
+    missing/unrecognized path or label field raises immediately with the
+    keys actually present, rather than producing wrong rows silently.
+    """
+    with open(path) as fh:
+        text = fh.read()
+
+    entries = None
+    stripped = text.strip()
+    if stripped.startswith("["):
+        try:
+            entries = json.loads(stripped)
+        except json.JSONDecodeError:
+            entries = None  # fall through to JSONL parsing below
+
+    if entries is None:
+        entries = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{path}:{lineno}: not valid JSON ({e}). Expected either a "
+                    f"single JSON array or one JSON object per line."
+                ) from e
+
+    if not entries:
+        raise ValueError(f"{path}: no entries found")
+
+    rows = []
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            raise ValueError(f"{path}: entry {i} is not a JSON object (got {type(e).__name__})")
+        path_val = next((e[k] for k in _JSON_PATH_KEYS if e.get(k)), None)
+        label_val = next((e[k] for k in _JSON_LABEL_KEYS if e.get(k) not in (None, "")), None)
+        if path_val is None:
+            raise ValueError(
+                f"{path}: entry {i} has no recognizable audio-path field "
+                f"(tried {_JSON_PATH_KEYS}). Keys present: {sorted(e)}"
+            )
+        if label_val is None:
+            raise ValueError(
+                f"{path}: entry {i} has no recognizable label field "
+                f"(tried {_JSON_LABEL_KEYS}). Keys present: {sorted(e)}"
+            )
+        dur = next((e[k] for k in _JSON_DURATION_KEYS if k in e), None)
+        rows.append({
+            "ID": str(e.get("ID") or e.get("id") or f"ext_{i:06d}"),
+            "duration": float(dur) if dur else 0.0,
+            "wav": path_val,
+            "label": str(label_val),
+        })
+    return rows
+
+
+def read_manifest(path):
+    """read_manifest_csv or read_manifest_json, chosen by extension."""
+    if path.lower().endswith(".json"):
+        return read_manifest_json(path)
+    return read_manifest_csv(path)
+
+
+def filter_known_labels(rows, known_codes, source_name="manifest"):
+    """Drop rows whose label isn't in known_codes, printing a clear summary
+    of what was dropped (language code -> count) rather than either crashing
+    on an unexpected label or silently mis-indexing it.
+
+    For an external eval set that may mix in languages/labels outside this
+    model's trained vocabulary (e.g. a genuinely multilingual holdout), this
+    is the expected, correct behaviour — but it must be visible, since a
+    silently-shrunk eval set changes what "accuracy" means without saying so.
+    """
+    known = set(known_codes)
+    kept, dropped = [], Counter()
+    for r in rows:
+        if r["label"] in known:
+            kept.append(r)
+        else:
+            dropped[r["label"]] += 1
+
+    if dropped:
+        total_dropped = sum(dropped.values())
+        top = ", ".join(f"{lbl}={n}" for lbl, n in dropped.most_common(15))
+        print(f"[warn] {source_name}: dropped {total_dropped}/{len(rows)} rows with labels "
+              f"outside this model's {len(known)}-class vocabulary: {top}"
+              + (" ..." if len(dropped) > 15 else ""), file=sys.stderr)
+
+    if not kept:
+        raise ValueError(
+            f"{source_name}: 0 rows remain after filtering to known labels {sorted(known)} — "
+            f"every row's label was unrecognized. Check the manifest's label field values "
+            f"and this model's idx_to_code / lang_map.csv against each other."
+        )
+    return kept

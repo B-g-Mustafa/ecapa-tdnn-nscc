@@ -21,6 +21,19 @@ explicitly (the two primary and two secondary confusion risks, per the
 measured zero-shot baseline in lid_test_results.txt). Checkpoints the best
 epoch by validation loss, not by yue accuracy alone.
 
+Optional second eval set (--external-eval-manifest): evaluated every epoch
+alongside the internal val split, for visibility into generalisation on data
+the model's own train/val split has zero relationship to. This set is
+MONITORING-ONLY by design — it never drives checkpoint selection or early
+stopping (only the internal val split does that), because the entire value
+of an independent eval set is that it stays untouched by any training
+decision. Using it for selection would quietly convert it into a second
+validation set and destroy the one honest number you have. Accepts a CSV
+(ID,duration,wav,label) or a JSON manifest (JSONL or a JSON array; common
+field-name aliases for path/label/duration are auto-detected). Rows whose
+label falls outside this run's 18-class vocabulary are dropped with a
+printed summary, not silently mis-indexed or fatally erroring.
+
 Usage:
     python scripts/train_19class.py \\
         --manifest-dir /home/users/ntu/birul001/scratch/data/common/manifests_19class \\
@@ -28,11 +41,12 @@ Usage:
         --output-dir ./runs/phase1_head_only \\
         --device cuda:0
 
-    # Phase 3a example:
+    # Phase 3a example, with the independent eval set monitored every epoch:
     python scripts/train_19class.py \\
         --manifest-dir ... --lang-map ... --output-dir ./runs/phase3a \\
         --init-checkpoint ./runs/phase1_head_only/best.pt \\
         --unfreeze blocks.3 blocks.1.se_block blocks.2.se_block \\
+        --external-eval-manifest /home/.../yuxi-eval-data/lid_eval_en_cv_mix_3s.json \\
         --lr-encoder 1e-4 --epochs 8 --device cuda:0
 """
 
@@ -50,8 +64,10 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from lid_common import (
     DEFAULT_SOURCE,
     expand_classifier_head,
+    filter_known_labels,
     load_classifier,
     load_lang_map,
+    read_manifest,
     read_manifest_csv,
     set_bn_eval,
     set_unfreeze_patterns,
@@ -318,10 +334,10 @@ def evaluate(model, loader, idx_to_code, device, has_unfrozen_encoder):
     }
 
 
-def print_epoch_report(epoch, train_loss, eval_result, idx_to_code, log_path=None):
-    lines = [f"\n--- Epoch {epoch} ---"]
-    lines.append(f"train_loss={train_loss:.4f}  val_loss={eval_result['val_loss']:.4f}  "
-                 f"val_acc={eval_result['overall_acc']:.4f}")
+def print_epoch_report(epoch, train_loss, eval_result, idx_to_code, log_path=None, title="val"):
+    lines = [f"\n--- Epoch {epoch} [{title}] ---"]
+    lines.append(f"train_loss={train_loss:.4f}  loss={eval_result['val_loss']:.4f}  "
+                 f"acc={eval_result['overall_acc']:.4f}")
     watch = [c for c in WATCH_CLASSES if c in idx_to_code]
     if watch:
         parts = []
@@ -358,6 +374,12 @@ def main():
     p.add_argument("--lang-map", required=True)
     p.add_argument("--yue-code", default="yue")
     p.add_argument("--val-split", default="val", help="'val' or 'dev', whichever exists")
+    p.add_argument("--external-eval-manifest", default=None,
+                   help="optional second eval set (.csv or .json), evaluated every epoch "
+                        "for monitoring ONLY — never used for checkpoint selection or "
+                        "early stopping. See the module docstring for why.")
+    p.add_argument("--external-eval-name", default=None,
+                   help="label for the external eval set in logs (default: its filename)")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--init-checkpoint", default=None,
                    help="resume model weights from a previous train_19class.py checkpoint "
@@ -492,6 +514,20 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                              collate_fn=collate_fn, num_workers=args.num_workers)
 
+    ext_loader = None
+    ext_name = None
+    if args.external_eval_manifest:
+        ext_name = args.external_eval_name or os.path.basename(args.external_eval_manifest)
+        log(f"Loading external eval set (monitoring-only, no effect on checkpoint "
+            f"selection): {args.external_eval_manifest}", args.log_file)
+        ext_rows = read_manifest(args.external_eval_manifest)
+        ext_rows = filter_known_labels(ext_rows, idx_to_code, source_name=ext_name)
+        log(f"External eval '{ext_name}': {len(ext_rows):,} rows after label filtering",
+            args.log_file)
+        ext_ds = ManifestDataset(ext_rows, code_to_idx, chunk_seconds=None)
+        ext_loader = DataLoader(ext_ds, batch_size=args.batch_size, shuffle=False,
+                                 collate_fn=collate_fn, num_workers=args.num_workers)
+
     speed_perturb = build_speed_perturb(device) if args.speed_perturb else None
     specaugment = build_specaugment(device) if args.specaugment else None
 
@@ -511,8 +547,18 @@ def main():
     # over those indices should already look sane (near the pretrained model's
     # own behaviour) since their rows were copied verbatim.
     initial_eval = evaluate(model, val_loader, idx_to_code, device, has_unfrozen_encoder)
-    log("\n=== Pre-training baseline (this run's val split) ===", args.log_file)
-    print_epoch_report(0, float("nan"), initial_eval, idx_to_code, log_path=args.log_file)
+    log("\n=== Pre-training baseline ===", args.log_file)
+    print_epoch_report(0, float("nan"), initial_eval, idx_to_code, log_path=args.log_file, title="val")
+
+    if ext_loader is not None:
+        # Also worth having as a sanity check in its own right: this should
+        # roughly reproduce whatever external number this checkpoint was
+        # already reported at (e.g. a colleague's independent eval report),
+        # confirming the manifest/loader line up before trusting anything
+        # that follows.
+        initial_ext_eval = evaluate(model, ext_loader, idx_to_code, device, has_unfrozen_encoder)
+        print_epoch_report(0, float("nan"), initial_ext_eval, idx_to_code,
+                            log_path=args.log_file, title=f"external:{ext_name}")
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
@@ -543,7 +589,17 @@ def main():
 
         train_loss = running_loss / max(n_batches, 1)
         eval_result = evaluate(model, val_loader, idx_to_code, device, has_unfrozen_encoder)
-        print_epoch_report(epoch, train_loss, eval_result, idx_to_code, log_path=args.log_file)
+        print_epoch_report(epoch, train_loss, eval_result, idx_to_code, log_path=args.log_file, title="val")
+
+        # Monitoring-only: computed and logged every epoch so you can watch
+        # generalisation in real time, but eval_result (internal val) is the
+        # only thing checked below for best-checkpoint / early-stop decisions.
+        ext_eval_result = None
+        if ext_loader is not None:
+            ext_eval_result = evaluate(model, ext_loader, idx_to_code, device, has_unfrozen_encoder)
+            print_epoch_report(epoch, train_loss, ext_eval_result, idx_to_code,
+                                log_path=args.log_file, title=f"external:{ext_name}")
+
         log(f"  epoch time: {time.time() - epoch_start:.1f}s", args.log_file)
 
         if eval_result["val_loss"] < best_val_loss:
@@ -560,6 +616,12 @@ def main():
                 "args": vars(args),
                 "val_loss": best_val_loss,
                 "val_metrics": eval_result,
+                # Recorded purely for traceability (so "how did the checkpoint
+                # we kept do on the independent set" is answerable without
+                # re-running eval) — NOT read anywhere in this script's own
+                # selection logic above.
+                "external_eval_name": ext_name,
+                "external_eval_metrics": ext_eval_result,
             }, best_path)
             log(f"  -> saved new best checkpoint to {best_path}", args.log_file)
         else:

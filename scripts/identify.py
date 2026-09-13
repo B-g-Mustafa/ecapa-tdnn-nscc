@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal LID inference: point at an audio folder or a manifest CSV, get a
-predicted language per file. No accuracy/confusion reporting — that's what
-evaluate_lid.py / evaluate_19class.py are for. This just predicts.
+"""Minimal LID inference: point at an audio folder or a manifest (.csv or
+.json), get a predicted language per file. No accuracy/confusion reporting
+— that's what evaluate_lid.py / evaluate_19class.py are for. This just
+predicts, so a manifest's label column (if any) is ignored — only its
+audio-path column is read.
 
 --checkpoint omitted -> pretrained speechbrain/lang-id-voxlingua107-ecapa (107-way)
 --checkpoint <path>  -> fine-tuned checkpoint (18-way)
@@ -9,6 +11,7 @@ evaluate_lid.py / evaluate_19class.py are for. This just predicts.
 Usage:
     python scripts/identify.py --input /path/to/audio_folder
     python scripts/identify.py --input manifests/test.csv --checkpoint ...best.pt
+    python scripts/identify.py --input lid_eval.json --checkpoint ...best.pt
 """
 
 import argparse
@@ -18,14 +21,14 @@ import sys
 
 import torch
 
-from lid_common import DEFAULT_SOURCE, is_audio, load_classifier, load_finetuned_model, read_manifest_csv, split_label
+from lid_common import DEFAULT_SOURCE, is_audio, load_classifier, load_finetuned_model, read_manifest, split_label
 
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".sph", ".aac")
 
 
 def find_files(path, exts):
-    if path.endswith(".csv"):
-        return [row["wav"] for row in read_manifest_csv(path)]
+    if path.lower().endswith((".csv", ".json")):
+        return [row["wav"] for row in read_manifest(path)]
     files = []
     for dirpath, dirnames, filenames in os.walk(path):
         dirnames[:] = [d for d in dirnames if not d.startswith("._")]

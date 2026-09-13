@@ -16,6 +16,13 @@ Usage:
         --val-manifest /home/.../manifests_19class/val.csv \\
         --output results/eval_19class.txt \\
         --device cuda:0
+
+    # Against a colleague's independent JSON eval set instead:
+    python scripts/evaluate_19class.py \\
+        --checkpoint ./runs/phase3a_blocks3_se/best.pt \\
+        --test-manifest /home/.../yuxi-eval-data/lid_eval_en_cv_mix_3s.json \\
+        --output results/eval_phase3a_external.txt \\
+        --device cuda:0
 """
 
 import argparse
@@ -26,7 +33,7 @@ from collections import Counter, defaultdict
 import torch
 from torch.utils.data import DataLoader
 
-from lid_common import DEFAULT_SOURCE, load_finetuned_model, read_manifest_csv
+from lid_common import DEFAULT_SOURCE, filter_known_labels, load_finetuned_model, read_manifest
 from train_19class import ManifestDataset, collate_fn, forward_batch
 
 WATCH_CLASSES = ("zh", "yue", "vi", "th")
@@ -84,10 +91,15 @@ def main():
     p.add_argument("--source", default=DEFAULT_SOURCE)
     p.add_argument("--savedir", default=None)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--test-manifest", required=True)
+    p.add_argument("--test-manifest", required=True,
+                   help=".csv (ID,duration,wav,label) or .json (JSONL or a JSON array; "
+                        "common field-name aliases auto-detected). Rows whose label "
+                        "isn't in this checkpoint's 18-class vocabulary are dropped "
+                        "with a printed summary.")
     p.add_argument("--val-manifest", default=None,
                    help="used for threshold calibration; if omitted, threshold "
-                        "calibration and its section of the report are skipped")
+                        "calibration and its section of the report are skipped. "
+                        "Same .csv/.json handling as --test-manifest.")
     p.add_argument("--target-frr", type=float, default=0.05,
                    help="target false-rejection rate for calibrating the unknown threshold")
     p.add_argument("--batch-size", type=int, default=32)
@@ -108,7 +120,8 @@ def main():
     code_to_idx = {c: i for i, c in enumerate(idx_to_code)}
     print(f"idx_to_code = {idx_to_code}")
 
-    test_rows = read_manifest_csv(args.test_manifest)
+    test_rows = read_manifest(args.test_manifest)
+    test_rows = filter_known_labels(test_rows, idx_to_code, source_name=args.test_manifest)
     test_ds = ManifestDataset(test_rows, code_to_idx, chunk_seconds=None)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                               collate_fn=collate_fn, num_workers=args.num_workers)
@@ -118,7 +131,8 @@ def main():
 
     val_results = None
     if args.val_manifest and os.path.exists(args.val_manifest):
-        val_rows = read_manifest_csv(args.val_manifest)
+        val_rows = read_manifest(args.val_manifest)
+        val_rows = filter_known_labels(val_rows, idx_to_code, source_name=args.val_manifest)
         val_ds = ManifestDataset(val_rows, code_to_idx, chunk_seconds=None)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                                  collate_fn=collate_fn, num_workers=args.num_workers)
