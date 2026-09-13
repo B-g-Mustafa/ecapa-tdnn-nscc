@@ -437,11 +437,22 @@ def main():
         for p in args.unfreeze
     ]
 
+    # blocks.0/1/2 hold the shared low-level dilated-TDNN conv feature
+    # extractors (tdnn1/res2net_block/tdnn2) and must stay frozen. Their
+    # se_block submodule is a narrow, validated exception: it's a small
+    # channel-reweighting gate, architecturally separate from those conv
+    # paths (blocks.0 has no se_block at all — it's a plain TDNNBlock, not
+    # SERes2NetBlock — so no exception applies there). Phase 3a's design is
+    # exactly "blocks.3 + blocks.1.se_block + blocks.2.se_block".
     forbidden = ("blocks.0", "blocks.1", "blocks.2")
+    se_exceptions = ("blocks.1.se_block", "blocks.2.se_block")
     for pattern in args.unfreeze:
+        if any(pattern == se or pattern.startswith(se + ".") for se in se_exceptions):
+            continue
         if any(pattern == f or pattern.startswith(f + ".") for f in forbidden):
             sys.exit(f"error: --unfreeze {pattern} touches a forbidden low-level block "
-                     f"(blocks.0/1/2). Per the plan, these must never be unfrozen.")
+                     f"(blocks.0/1/2's conv paths). Per the plan, these must never be "
+                     f"unfrozen — the only exception is {se_exceptions}.")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
