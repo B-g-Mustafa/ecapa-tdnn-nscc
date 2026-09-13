@@ -398,6 +398,10 @@ def main():
                         "early stopping. See the module docstring for why.")
     p.add_argument("--external-eval-name", default=None,
                    help="label for the external eval set in logs (default: its filename)")
+    p.add_argument("--external-eval-audio-root", default=None,
+                   help="joined onto any audio path in --external-eval-manifest that "
+                        "isn't already absolute — needed when that manifest stores "
+                        "paths relative to wherever it expects to be run from.")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--init-checkpoint", default=None,
                    help="resume model weights from a previous train_19class.py checkpoint "
@@ -549,7 +553,7 @@ def main():
         ext_name = args.external_eval_name or os.path.basename(args.external_eval_manifest)
         log(f"Loading external eval set (monitoring-only, no effect on checkpoint "
             f"selection): {args.external_eval_manifest}", args.log_file)
-        ext_rows = read_manifest(args.external_eval_manifest)
+        ext_rows = read_manifest(args.external_eval_manifest, audio_root=args.external_eval_audio_root)
         ext_rows = filter_known_labels(ext_rows, idx_to_code, source_name=ext_name)
         log(f"External eval '{ext_name}': {len(ext_rows):,} rows after label filtering",
             args.log_file)

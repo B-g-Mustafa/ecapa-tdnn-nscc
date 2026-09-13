@@ -26,9 +26,9 @@ from lid_common import DEFAULT_SOURCE, is_audio, load_classifier, load_finetuned
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".sph", ".aac")
 
 
-def find_files(path, exts):
+def find_files(path, exts, audio_root=None):
     if path.lower().endswith((".csv", ".json")):
-        return [row["wav"] for row in read_manifest(path)]
+        return [row["wav"] for row in read_manifest(path, audio_root=audio_root)]
     files = []
     for dirpath, dirnames, filenames in os.walk(path):
         dirnames[:] = [d for d in dirnames if not d.startswith("._")]
@@ -71,7 +71,10 @@ def predict(model, path, idx_to_code):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--input", required=True, help="audio folder, or a manifest CSV with a 'wav' column")
+    p.add_argument("--input", required=True, help="audio folder, or a manifest (.csv/.json) with a 'wav' column")
+    p.add_argument("--audio-root", default=None,
+                   help="joined onto any audio path in --input (when it's a manifest) "
+                        "that isn't already absolute.")
     p.add_argument("--checkpoint", default=None,
                    help="train_19class.py checkpoint; omit to use the pretrained HF model instead")
     p.add_argument("--source", default=DEFAULT_SOURCE)
@@ -91,7 +94,7 @@ def main():
         model = load_classifier(args.source, args.savedir, device)
         idx_to_code = None
 
-    files = find_files(args.input, AUDIO_EXTS)
+    files = find_files(args.input, AUDIO_EXTS, audio_root=args.audio_root)
     if not files:
         sys.exit(f"error: no audio files found under {args.input}")
 

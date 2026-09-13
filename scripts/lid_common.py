@@ -245,7 +245,7 @@ _JSON_LABEL_KEYS = ("label", "lang", "language", "lang_id", "target")
 _JSON_DURATION_KEYS = ("duration", "dur")
 
 
-def read_manifest_json(path):
+def read_manifest_json(path, audio_root=None):
     """Read a JSON manifest into the same row shape read_manifest_csv returns
     (dicts with ID, duration, wav, label) — so callers never need to care
     which format a manifest came from.
@@ -260,6 +260,12 @@ def read_manifest_json(path):
     someone else's pipeline isn't something to guess once and hope — a
     missing/unrecognized path or label field raises immediately with the
     keys actually present, rather than producing wrong rows silently.
+
+    audio_root: if given, joined onto any audio path that ISN'T already
+    absolute (os.path.isabs) — NeMo-style manifests commonly store paths
+    relative to wherever the manifest itself expects to be run from, which
+    is almost never this repo's cwd. Already-absolute paths are left as-is,
+    so this is safe to pass even when only some entries are relative.
     """
     with open(path) as fh:
         text = fh.read()
@@ -300,6 +306,8 @@ def read_manifest_json(path):
                 f"{path}: entry {i} has no recognizable audio-path field "
                 f"(tried {_JSON_PATH_KEYS}). Keys present: {sorted(e)}"
             )
+        if audio_root and not os.path.isabs(path_val):
+            path_val = os.path.join(audio_root, path_val)
         if label_val is None:
             raise ValueError(
                 f"{path}: entry {i} has no recognizable label field "
@@ -315,11 +323,22 @@ def read_manifest_json(path):
     return rows
 
 
-def read_manifest(path):
-    """read_manifest_csv or read_manifest_json, chosen by extension."""
+def read_manifest(path, audio_root=None):
+    """read_manifest_csv or read_manifest_json, chosen by extension.
+
+    audio_root: see read_manifest_json — joined onto any non-absolute audio
+    path. Every CSV manifest this project writes already stores absolute
+    paths, so this is a no-op for those in practice, but it's applied
+    consistently rather than only supported for one format.
+    """
     if path.lower().endswith(".json"):
-        return read_manifest_json(path)
-    return read_manifest_csv(path)
+        return read_manifest_json(path, audio_root=audio_root)
+    rows = read_manifest_csv(path)
+    if audio_root:
+        for row in rows:
+            if not os.path.isabs(row["wav"]):
+                row["wav"] = os.path.join(audio_root, row["wav"])
+    return rows
 
 
 def filter_known_labels(rows, known_codes, source_name="manifest"):

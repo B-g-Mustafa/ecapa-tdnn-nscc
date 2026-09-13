@@ -100,6 +100,9 @@ def main():
                    help="used for threshold calibration; if omitted, threshold "
                         "calibration and its section of the report are skipped. "
                         "Same .csv/.json handling as --test-manifest.")
+    p.add_argument("--audio-root", default=None,
+                   help="joined onto any audio path in --test-manifest/--val-manifest "
+                        "that isn't already absolute (applies to both).")
     p.add_argument("--target-frr", type=float, default=0.05,
                    help="target false-rejection rate for calibrating the unknown threshold")
     p.add_argument("--batch-size", type=int, default=32)
@@ -120,7 +123,7 @@ def main():
     code_to_idx = {c: i for i, c in enumerate(idx_to_code)}
     print(f"idx_to_code = {idx_to_code}")
 
-    test_rows = read_manifest(args.test_manifest)
+    test_rows = read_manifest(args.test_manifest, audio_root=args.audio_root)
     test_rows = filter_known_labels(test_rows, idx_to_code, source_name=args.test_manifest)
     test_ds = ManifestDataset(test_rows, code_to_idx, chunk_seconds=None)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
@@ -131,7 +134,7 @@ def main():
 
     val_results = None
     if args.val_manifest and os.path.exists(args.val_manifest):
-        val_rows = read_manifest(args.val_manifest)
+        val_rows = read_manifest(args.val_manifest, audio_root=args.audio_root)
         val_rows = filter_known_labels(val_rows, idx_to_code, source_name=args.val_manifest)
         val_ds = ManifestDataset(val_rows, code_to_idx, chunk_seconds=None)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,

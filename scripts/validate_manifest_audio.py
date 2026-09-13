@@ -27,14 +27,25 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--manifest", required=True, help=".csv or .json manifest")
+    p.add_argument("--audio-root", default=None,
+                   help="joined onto any audio path in the manifest that isn't already "
+                        "absolute. Needed when a manifest stores paths relative to "
+                        "wherever it expects to be run from (e.g. 'data/voxlingua/...').")
     p.add_argument("--limit", type=int, default=None, help="check only the first N rows")
     p.add_argument("--show-failures", type=int, default=20,
                    help="print this many failing paths with their error (default 20)")
+    p.add_argument("--fail-threshold", type=float, default=0.0,
+                   help="exit 1 only if the failure RATE exceeds this fraction (default "
+                        "0.0: any failure exits 1, for ad-hoc manual checks). Raise this "
+                        "when calling from a job script that should tolerate a handful of "
+                        "genuinely-bad files (the training pipeline skips those on its "
+                        "own) but still abort loudly if e.g. --audio-root is still wrong "
+                        "and most of the manifest is unreachable.")
     args = p.parse_args()
 
     import soundfile as sf
 
-    rows = read_manifest(args.manifest)
+    rows = read_manifest(args.manifest, audio_root=args.audio_root)
     if args.limit:
         rows = rows[:args.limit]
     print(f"Checking {len(rows):,} rows from {args.manifest} ...\n")
@@ -86,7 +97,9 @@ def main():
         for path, etype, err in failures[:args.show_failures]:
             print(f"  [{etype}] {path}\n      {err}")
 
-    if failures:
+    fail_rate = len(failures) / max(n, 1)
+    if fail_rate > args.fail_threshold:
+        print(f"\nfailure rate {fail_rate:.1%} exceeds --fail-threshold {args.fail_threshold:.1%}")
         sys.exit(1)  # non-zero exit so a calling script can gate on this
 
 
