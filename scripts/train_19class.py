@@ -130,7 +130,20 @@ class ManifestDataset(Dataset):
         import torchaudio
 
         row = self.rows[i]
-        wav, sr = torchaudio.load(row["wav"])
+        try:
+            wav, sr = torchaudio.load(row["wav"])
+        except Exception as e:
+            # A single unreadable file (bad codec, non-ASCII path libsndfile's
+            # C error buffer can't round-trip, truncated download, ...) must
+            # not kill an entire epoch — especially on a manifest from
+            # somewhere else that this pipeline has never touched before.
+            # str(e) can itself raise here (seen in practice: soundfile's
+            # SoundFileError.__str__ fails on some libsndfile errors), so
+            # report type+repr instead of trusting str().
+            print(f"[warn] skipping unreadable audio ({type(e).__name__}: {e!r}): "
+                  f"{row['wav']}", file=sys.stderr)
+            return None
+
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
@@ -148,6 +161,9 @@ class ManifestDataset(Dataset):
 
 
 def collate_fn(batch):
+    batch = [b for b in batch if b is not None]  # drop unreadable-file skips
+    if not batch:
+        return None, None, None  # whole batch was unreadable — caller skips it
     wavs, labels = zip(*batch)
     lengths = torch.tensor([w.shape[0] for w in wavs])
     max_len = int(lengths.max().item())
@@ -309,6 +325,8 @@ def evaluate(model, loader, idx_to_code, device, has_unfrozen_encoder):
     overall_correct, overall_total = 0, 0
 
     for wavs, rel_lengths, labels in loader:
+        if wavs is None:  # every file in this batch failed to load — see ManifestDataset
+            continue
         wavs, rel_lengths, labels = wavs.to(device), rel_lengths.to(device), labels.to(device)
         log_probs = forward_batch(model, wavs, rel_lengths, has_unfrozen_encoder)
         loss = F.nll_loss(log_probs, labels)
@@ -581,6 +599,8 @@ def main():
         running_loss, n_batches = 0.0, 0
 
         for wavs, rel_lengths, labels in train_loader:
+            if wavs is None:  # every file in this batch failed to load — see ManifestDataset
+                continue
             wavs, rel_lengths, labels = wavs.to(device), rel_lengths.to(device), labels.to(device)
 
             if speed_perturb is not None:
